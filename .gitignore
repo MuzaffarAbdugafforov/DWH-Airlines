@@ -1,9 +1,0 @@
-# DBeaver saved passwords (encrypted with a publicly known key)
-.dbeaver/credentials-config.json
-
-# DBeaver backup files
-*.bak
-
-# Connection scripts with plain-text passwords
-Scripts/config-connection.sql
-Scripts/Inmon connection_config.sql
