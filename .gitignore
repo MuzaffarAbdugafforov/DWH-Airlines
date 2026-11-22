@@ -1,0 +1,4 @@
+.dbeaver/
+*.bak
+*.log
+.env
