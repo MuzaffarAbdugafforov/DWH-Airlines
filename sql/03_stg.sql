@@ -59,3 +59,230 @@
 -- Проверки между таблицами (ссылочная целостность, validity маршрута,
 -- посадки <= вместимость, сверка сумм SOURCE <-> DDS <-> DM) - в ODS / DDS / DM.
 -- =====================================================================
+
+
+-- =====================================================================
+-- STG DDL
+-- =====================================================================
+-- Формат как в etl_lab (stg.customers, stg.sales):
+--   - типизированные колонки, NOT NULL, PK на бизнес-ключе;
+--   - CHECK-ограничения повторяют правила карантина (последняя защита:
+--     если строка прошла мимо карантина, insert упадёт, а не загрузит мусор).
+-- Бизнес-колонки = колонки ODS (уже разобранные jsonb / point / tstzrange).
+-- Служебные колонки (ТЗ п.6, план п.3):
+--   row_hash    - хеш из RAW без пересчёта, по нему сравниваем с ODS;
+--   change_type - 'I' новая строка, 'U' изменённая;
+--   run_id, step_id, loaded_at.
+-- FK в STG нет (как в etl_lab): связи проверяются в ODS.
+
+
+--drop table if exists stg.airports;
+--drop table if exists stg.airplanes;
+--drop table if exists stg.seats;
+--drop table if exists stg.routes;
+--drop table if exists stg.flights;
+--drop table if exists stg.bookings;
+--drop table if exists stg.tickets;
+--drop table if exists stg.segments;
+--drop table if exists stg.boarding_passes;
+
+
+-- =====================================================================
+-- Справочники
+-- =====================================================================
+
+-- аэропорты: airport_name/city/country jsonb ->> 'en'/'ru', coordinates[0]/[1]
+create table if not exists stg.airports (
+	airport_code char(3) not null,
+	airport_name_en text not null,
+	airport_name_ru text not null,
+	city_en text not null,
+	city_ru text not null,
+	country_en text not null,
+	country_ru text not null,
+	longitude double precision not null,
+	latitude double precision not null,
+	timezone text not null,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_airports primary key (airport_code),
+	constraint ck_stg_airports_change_type check (change_type in ('I', 'U'))
+);
+
+
+-- самолёты: model jsonb ->> 'en'/'ru'
+create table if not exists stg.airplanes (
+	airplane_code char(3) not null,
+	model_en text not null,
+	model_ru text not null,
+	range integer not null,
+	speed integer not null,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_airplanes primary key (airplane_code),
+	constraint ck_stg_airplanes_change_type check (change_type in ('I', 'U'))
+);
+
+
+-- места
+create table if not exists stg.seats (
+	airplane_code char(3) not null,
+	seat_no text not null,
+	fare_conditions text not null,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_seats primary key (airplane_code, seat_no),
+	constraint ck_stg_seats_change_type check (change_type in ('I', 'U')),
+	-- DQ_STG_004
+	constraint ck_stg_seats_fare_conditions
+		check (fare_conditions in ('Economy', 'Comfort', 'Business'))
+);
+
+
+-- маршруты: validity tstzrange -> lower() = valid_from, upper() = valid_to, период [valid_from, valid_to)
+create table if not exists stg.routes (
+	route_no text not null,
+	valid_from timestamptz not null,
+	valid_to timestamptz not null,
+	departure_airport char(3) not null,
+	arrival_airport char(3) not null,
+	airplane_code char(3) not null,
+	days_of_week integer[] not null,
+	scheduled_time time not null,
+	duration interval not null,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_routes primary key (route_no, valid_from),
+	constraint ck_stg_routes_change_type check (change_type in ('I', 'U'))
+);
+
+
+-- =====================================================================
+-- Операционные сущности
+-- =====================================================================
+
+-- рейсы (actual_* могут быть NULL - рейс ещё не выполнен)
+create table if not exists stg.flights (
+	flight_id integer not null,
+	route_no text not null,
+	status text not null,
+	scheduled_departure timestamptz not null,
+	scheduled_arrival timestamptz not null,
+	actual_departure timestamptz,
+	actual_arrival timestamptz,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_flights primary key (flight_id),
+	constraint ck_stg_flights_change_type check (change_type in ('I', 'U')),
+	-- DQ_STG_005 (NULL в actual_* даёт unknown -> CHECK проходит, это и нужно)
+	constraint ck_stg_flights_scheduled_dates
+		check (scheduled_arrival >= scheduled_departure),
+	constraint ck_stg_flights_actual_dates
+		check (actual_arrival >= actual_departure),
+	-- DQ_STG_006
+	constraint ck_stg_flights_status
+		check (status in ('Scheduled', 'On Time', 'Delayed', 'Boarding', 'Departed', 'Arrived', 'Cancelled'))
+);
+
+
+-- бронирования
+create table if not exists stg.bookings (
+	book_ref char(6) not null,
+	book_date timestamptz not null,
+	total_amount numeric(10, 2) not null,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_bookings primary key (book_ref),
+	constraint ck_stg_bookings_change_type check (change_type in ('I', 'U'))
+);
+
+
+-- билеты
+create table if not exists stg.tickets (
+	ticket_no text not null,
+	book_ref char(6) not null,
+	passenger_id text not null,
+	passenger_name text not null,
+	outbound boolean not null,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_tickets primary key (ticket_no),
+	constraint ck_stg_tickets_change_type check (change_type in ('I', 'U'))
+);
+
+
+-- перелёты в составе билета
+create table if not exists stg.segments (
+	ticket_no text not null,
+	flight_id integer not null,
+	fare_conditions text not null,
+	price numeric(10, 2) not null,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_segments primary key (ticket_no, flight_id),
+	constraint ck_stg_segments_change_type check (change_type in ('I', 'U')),
+	-- DQ_STG_003
+	constraint ck_stg_segments_price check (price >= 0),
+	-- DQ_STG_004
+	constraint ck_stg_segments_fare_conditions
+		check (fare_conditions in ('Economy', 'Comfort', 'Business'))
+);
+
+
+-- посадочные талоны (boarding_no / boarding_time NULL = посадки не было)
+create table if not exists stg.boarding_passes (
+	ticket_no text not null,
+	flight_id integer not null,
+	seat_no text not null,
+	boarding_no integer,
+	boarding_time timestamptz,
+
+	row_hash varchar(32) not null,
+	change_type char(1) not null,
+	run_id integer not null,
+	step_id integer not null,
+	loaded_at timestamptz not null default clock_timestamp(),
+
+	constraint pk_stg_boarding_passes primary key (ticket_no, flight_id),
+	constraint ck_stg_boarding_passes_change_type check (change_type in ('I', 'U'))
+);

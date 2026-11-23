@@ -4,6 +4,7 @@
 -- Структура взята из etl_lab (etl.etl_runs, etl.etl_step_logs).
 
 
+--drop table if exists etl.etl_quarantine;
 --drop table if exists etl.etl_dq_results;
 --drop table if exists etl.etl_step_logs;
 --drop table if exists etl.etl_runs;
@@ -111,3 +112,30 @@ create table if not exists etl.etl_dq_results (
 create index if not exists ix_etl_dq_results_run_id on etl.etl_dq_results (run_id);
 create index if not exists ix_etl_dq_results_step_id on etl.etl_dq_results (step_id);
 create index if not exists ix_etl_dq_results_rule_code on etl.etl_dq_results (rule_code);
+
+
+-- ТЗ п.6: карантин - некорректные строки не теряются, а сохраняются с причиной отклонения.
+-- Структура взята из etl_lab (etl.etl_quarantine).
+-- Одна строка = одна отклонённая запись: вся строка в row_data (to_jsonb), правило и причина.
+
+create table if not exists etl.etl_quarantine (
+	quarantine_id serial primary key,
+	run_id integer not null,
+	step_id integer not null,
+	source_table varchar(100) not null,
+	row_data jsonb not null,
+	rule_code varchar(50) not null,
+	reject_reason text not null,
+	created_at timestamptz not null default clock_timestamp(),
+	status varchar(20) not null default 'NEW',
+
+	constraint fk_etl_quarantine_run
+		foreign key (run_id) references etl.etl_runs (run_id),
+	constraint fk_etl_quarantine_step
+		foreign key (step_id) references etl.etl_step_logs (step_id),
+	constraint ck_etl_quarantine_status
+		check (status in ('NEW', 'IN_REVIEW', 'RESOLVED', 'DISMISSED'))
+);
+
+create index if not exists ix_etl_quarantine_run_id on etl.etl_quarantine (run_id);
+create index if not exists ix_etl_quarantine_step_id on etl.etl_quarantine (step_id);
