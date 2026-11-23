@@ -68,6 +68,9 @@ create table if not exists etl.etl_step_logs (
 		check (status = 'FAILED' or error_message is null)
 );
 
+-- индекс под FK: поиск всех этапов одного запуска
+create index if not exists ix_etl_step_logs_run_id on etl.etl_step_logs (run_id);
+
 
 -- ТЗ п.7: не менее 10 исполняемых проверок с сохранением результатов
 -- (DQ rule, дата/запуск, число нарушений, примеры ключей).
@@ -108,4 +111,3 @@ create table if not exists etl.etl_dq_results (
 create index if not exists ix_etl_dq_results_run_id on etl.etl_dq_results (run_id);
 create index if not exists ix_etl_dq_results_step_id on etl.etl_dq_results (step_id);
 create index if not exists ix_etl_dq_results_rule_code on etl.etl_dq_results (rule_code);
-
