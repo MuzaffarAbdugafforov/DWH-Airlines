@@ -913,6 +913,8 @@ as $$
 				bookings.airplanes_data ap;
 
 			get diagnostics v_rows_inserted = row_count;
+			
+--			raise exception 'Artifisial Error!';
 
 			if v_rows_read <> v_rows_inserted then
 				raise exception
@@ -1164,12 +1166,44 @@ $$;
 
 
 do $$
-declare 
-	p_run_id int;
+declare
+        p_run_id int;
+        v_failed_steps int;
 begin
-	insert into etl.etl_runs (load_type)
-	values ('FULL') returning run_id into p_run_id
-	call raw.load_bookings(p_run_id)
-end;
+        insert into etl.etl_runs (load_type)
+        values ('FULL')
+        returning run_id into p_run_id;
 
+        call raw.load_bookings(p_run_id);
+        call raw.load_tickets(p_run_id);
+        call raw.load_segments(p_run_id);
+        call raw.load_flights(p_run_id);
+        call raw.load_boarding_passes(p_run_id);
+        call raw.load_routes(p_run_id);
+        call raw.load_airports_data(p_run_id);
+        call raw.load_airplanes_data(p_run_id);
+        call raw.load_seats(p_run_id);
+
+        call etl.check_raw(p_run_id);
+
+        -- закрываем run: FAILED, если упал хотя бы один этап
+        select count(*)
+        into v_failed_steps
+        from etl.etl_step_logs
+        where run_id = p_run_id
+                and status = 'FAILED';
+
+        update etl.etl_runs
+        set
+                ended_at = clock_timestamp(),
+                status = case when v_failed_steps = 0 then 'SUCCESS' else 'FAILED' end,
+                error_message = case when v_failed_steps = 0 then null
+                        else v_failed_steps || ' step(s) failed, see etl.etl_step_logs' end
+        where run_id = p_run_id;
+
+        raise notice 'run_id = %, failed steps = %', p_run_id, v_failed_steps;
+end;
 $$ language plpgsql;
+
+
+select * from raw.airplanes_data ad;

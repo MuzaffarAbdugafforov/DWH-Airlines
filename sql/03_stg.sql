@@ -1,0 +1,61 @@
+-- stg layer
+
+-- =====================================================================
+-- ПЛАН STG (реализуем после создания ODS)
+-- =====================================================================
+--
+-- ТЗ п.3: приведение типов, именований, дат и форматов; явная обработка
+--         NULL, дублей и некорректных значений с журналом отклонений.
+-- ТЗ п.2: в STG минимум 6 основных таблиц.
+-- ТЗ п.6: полная загрузка, затем инкременты через сравнение ключей / хешей;
+--         небезопасные строки -> карантин, не удалять молча; идемпотентность.
+--
+-- 1. ТАБЛИЦЫ (не решено: все 9 или только 6 обязательных)
+--    обязательные: bookings, tickets, segments, flights, boarding_passes, routes
+--    нужны для KPI: seats (загрузка мест), airports_data, airplanes_data
+--
+-- 2. ПРЕОБРАЗОВАНИЯ
+--    airports_data  -> stg.airports:  jsonb -> airport_name_en/ru, city_en/ru, country_en/ru;
+--                                     coordinates (point) -> longitude, latitude
+--    airplanes_data -> stg.airplanes: model jsonb -> model_en / model_ru
+--    routes: validity (tstzrange) -> valid_from / valid_to
+--            (704 route_no, 1162 строки, 4 месячных периода)
+--    остальные: колонки и типы как есть, trim() для текста
+--
+-- 3. FULL / INCREMENTAL  (поток: RAW -> STG -> ODS)
+--    STG очищается в начале каждого запуска и хранит только текущий пакет.
+--    Предыдущее состояние берётся из ODS (сравнение по ключу и row_hash):
+--      FULL:        все строки из RAW, change_type = 'I'
+--      INCREMENTAL: ключа нет в ODS          -> change_type = 'I' (новая)
+--                   ключ есть, row_hash другой -> change_type = 'U' (изменённая)
+--                   ключ и row_hash совпадают  -> пропускаем
+--    row_hash передаётся дальше RAW -> STG -> ODS.
+--    Удаления не обрабатываем (в тестовых сценариях ТЗ их нет).
+--    Служебные поля STG: run_id, step_id, row_hash, change_type, loaded_at.
+--    Зависимость: таблицы ODS (бизнес-ключ + row_hash) должны существовать.
+--
+-- 4. КАРАНТИН (etl.etl_quarantine создаём в начале STG, структура из etl_lab)
+--    некорректные строки -> etl.etl_quarantine (row_data = to_jsonb(r), rule_code, reject_reason),
+--    в STG не попадают; сверка в каждом загрузчике: read = inserted + rejected.
+--      DQ_STG_001  бизнес-ключ NULL                                    все таблицы
+--      DQ_STG_002  дубль бизнес-ключа (в карантин все копии)            все таблицы
+--      DQ_STG_003  price NULL или < 0                                   segments
+--      DQ_STG_004  fare_conditions не in (Economy, Comfort, Business)   segments, seats
+--      DQ_STG_005  scheduled_arrival < scheduled_departure, или
+--                  actual_arrival < actual_departure (если оба заполнены) flights
+--      DQ_STG_006  status не in (Scheduled, On Time, Delayed, Boarding,
+--                  Departed, Arrived, Cancelled)                        flights
+--
+-- 5. DQ В etl_dq_results: etl.check_stg(p_run_id), просто как check_raw
+--    - по каждой таблице: число строк в карантине по каждому правилу в этом запуске
+--    - только для FULL: сверка суммы price  RAW = STG + карантин (как DQ006 в etl_lab)
+--
+-- 6. ОСОБЕННОСТИ ДАННЫХ (не ошибки)
+--    boarding_passes: 30 360 строк без boarding_no / boarding_time - талон выдан,
+--      посадки не было; для загрузки мест считать только boarding_time is not null.
+--    flights: ~10 800 рейсов без фактических времён (Scheduled и т.п.) - норма,
+--      DQ_STG_005 проверяет actual только если оба заполнены.
+--
+-- Проверки между таблицами (ссылочная целостность, validity маршрута,
+-- посадки <= вместимость, сверка сумм SOURCE <-> DDS <-> DM) - в ODS / DDS / DM.
+-- =====================================================================
