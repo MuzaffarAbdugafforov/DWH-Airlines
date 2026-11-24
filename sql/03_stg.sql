@@ -483,16 +483,6 @@ as $$
 $$;
 
 
--- ---------------------------------------------------------------------
--- Остальные 8 загрузчиков - тот же шаблон, что stg.load_airports.
--- Отличия по таблицам: ключ, преобразования, дополнительные правила карантина.
--- NULL в проверяемых полях (price, fare_conditions, status) -> тоже карантин
--- (иначе not in (...) даёт NULL, строка не попадёт ни в STG, ни в карантин).
--- Ключевые поля и коды-домены не trim-уем: ключ должен совпадать с ODS,
--- а значение с пробелами - некорректное, его не исправляем молча, а в карантин.
--- ---------------------------------------------------------------------
-
-
 -- самолёты: raw.airplanes_data -> stg.airplanes
 -- правила карантина: DQ_STG_001 (ключ NULL), DQ_STG_002 (дубль ключа)
 create or replace procedure stg.load_airplanes(p_run_id integer)
@@ -1835,3 +1825,253 @@ as $$
 		end;
 	end;
 $$;
+
+
+
+-- =====================================================================
+-- STG DQ: etl.check_stg (как check_raw: параметризованные процедуры + вызовы)
+-- ТЗ п.7: DQ-правила с сохранением результатов; сверка сумм между слоями.
+--   DQ_STG_001..006  сколько строк ушло в карантин по правилу в этом запуске
+--                    (правила применяются в загрузчиках, здесь только фиксируем итог)
+--   DQ_STG_007       сироты - отложено (см. комментарий у STG DDL)
+--   DQ_STG_008       сумма RAW = STG + карантин (только FULL: при INCREMENTAL
+--                    STG хранит только пакет, суммы с RAW не совпадут)
+-- p_table_name - имя STG-таблицы без схемы ('airports', 'segments', ...).
+-- step_id - этап загрузки этой STG-таблицы в текущем запуске;
+-- карантин отбираем по этому step_id.
+-- =====================================================================
+
+create or replace procedure etl.dq_stg_quarantine(p_run_id integer, p_table_name text, p_rule_code text)
+language plpgsql
+as $$
+	declare
+		v_step_id int;
+		v_rows_read int;
+	begin
+		select max(sl.step_id)
+		into v_step_id
+		from etl.etl_step_logs sl
+		where sl.run_id = p_run_id
+			and sl.table_name = 'stg.' || p_table_name;
+
+		select sl.rows_read
+		into v_rows_read
+		from etl.etl_step_logs sl
+		where sl.step_id = v_step_id;
+
+		insert into etl.etl_dq_results (
+			run_id,
+			step_id,
+			table_name,
+			rule_code,
+			rule_description,
+			severity,
+			rows_checked,
+			violations_count,
+			sample_keys,
+			status
+		)
+		select
+			p_run_id,
+			v_step_id,
+			'stg.' || p_table_name,
+			p_rule_code,
+			case p_rule_code
+				when 'DQ_STG_001' then 'Business key is NULL'
+				when 'DQ_STG_002' then 'Duplicate business key'
+				when 'DQ_STG_003' then 'price is NULL or negative'
+				when 'DQ_STG_004' then 'Invalid fare_conditions'
+				when 'DQ_STG_005' then 'Arrival before departure'
+				when 'DQ_STG_006' then 'Invalid flight status'
+			end,
+			'ERROR',
+			coalesce(v_rows_read, 0),
+			count(q.quarantine_id),
+			-- первые 10 quarantine_id: по ним смотрим строки в etl.etl_quarantine
+			coalesce((array_to_json((array_agg(q.quarantine_id order by q.quarantine_id))[1:10]))::jsonb, '[]'),
+			case
+				when count(q.quarantine_id) = 0 then 'PASSED'
+				else 'FAILED'
+			end
+		from etl.etl_quarantine q
+		where q.step_id = v_step_id
+			and q.rule_code = p_rule_code;
+	end;
+$$;
+
+
+
+create or replace procedure etl.dq_stg_sum(p_run_id integer, p_table_name text, p_column_name text)
+language plpgsql
+as $$
+	declare
+		v_step_id int;
+		v_raw_sum numeric;
+		v_raw_count bigint;
+		v_stg_sum numeric;
+		v_quarantine_sum numeric;
+	begin
+		select max(sl.step_id)
+		into v_step_id
+		from etl.etl_step_logs sl
+		where sl.run_id = p_run_id
+			and sl.table_name = 'stg.' || p_table_name;
+
+		-- имя RAW-таблицы совпадает с STG для bookings и segments
+		execute format('select coalesce(sum(%I), 0), count(*) from raw.%I', p_column_name, p_table_name)
+		into v_raw_sum, v_raw_count;
+
+		execute format('select coalesce(sum(%I), 0) from stg.%I', p_column_name, p_table_name)
+		into v_stg_sum;
+
+		-- в карантине строка хранится как jsonb; NULL-цена (DQ_STG_003) -> coalesce
+		select coalesce(sum((q.row_data ->> p_column_name)::numeric), 0)
+		into v_quarantine_sum
+		from etl.etl_quarantine q
+		where q.step_id = v_step_id;
+
+		insert into etl.etl_dq_results (
+			run_id,
+			step_id,
+			table_name,
+			rule_code,
+			rule_description,
+			severity,
+			rows_checked,
+			violations_count,
+			status
+		)
+		select
+			p_run_id,
+			v_step_id,
+			'stg.' || p_table_name,
+			'DQ_STG_008',
+			'Sum of ' || p_column_name || ' mismatch: RAW <> STG + quarantine',
+			'CRITICAL',
+			v_raw_count,
+			case
+				when v_raw_sum = v_stg_sum + v_quarantine_sum then 0
+				else 1
+			end,
+			case
+				when v_raw_sum = v_stg_sum + v_quarantine_sum then 'PASSED'
+				else 'FAILED'
+			end;
+	end;
+$$;
+
+
+
+create or replace procedure etl.check_stg(p_run_id integer)
+language plpgsql
+as $$
+	declare
+		v_load_type varchar(20);
+	begin
+		call etl.dq_stg_quarantine(p_run_id, 'airports', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'airports', 'DQ_STG_002');
+
+		call etl.dq_stg_quarantine(p_run_id, 'airplanes', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'airplanes', 'DQ_STG_002');
+
+		call etl.dq_stg_quarantine(p_run_id, 'seats', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'seats', 'DQ_STG_002');
+		call etl.dq_stg_quarantine(p_run_id, 'seats', 'DQ_STG_004');
+
+		call etl.dq_stg_quarantine(p_run_id, 'routes', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'routes', 'DQ_STG_002');
+
+		call etl.dq_stg_quarantine(p_run_id, 'flights', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'flights', 'DQ_STG_002');
+		call etl.dq_stg_quarantine(p_run_id, 'flights', 'DQ_STG_005');
+		call etl.dq_stg_quarantine(p_run_id, 'flights', 'DQ_STG_006');
+
+		call etl.dq_stg_quarantine(p_run_id, 'bookings', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'bookings', 'DQ_STG_002');
+
+		call etl.dq_stg_quarantine(p_run_id, 'tickets', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'tickets', 'DQ_STG_002');
+
+		call etl.dq_stg_quarantine(p_run_id, 'segments', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'segments', 'DQ_STG_002');
+		call etl.dq_stg_quarantine(p_run_id, 'segments', 'DQ_STG_003');
+		call etl.dq_stg_quarantine(p_run_id, 'segments', 'DQ_STG_004');
+
+		call etl.dq_stg_quarantine(p_run_id, 'boarding_passes', 'DQ_STG_001');
+		call etl.dq_stg_quarantine(p_run_id, 'boarding_passes', 'DQ_STG_002');
+
+		-- сверка сумм только для FULL
+		select load_type
+		into v_load_type
+		from etl.etl_runs
+		where run_id = p_run_id;
+
+		if v_load_type = 'FULL' then
+			call etl.dq_stg_sum(p_run_id, 'bookings', 'total_amount');
+			call etl.dq_stg_sum(p_run_id, 'segments', 'price');
+		end if;
+	end;
+$$;
+
+
+do $$
+declare
+        p_run_id int;
+        v_failed_steps int;
+begin
+        insert into etl.etl_runs (load_type)
+        values ('FULL')
+        returning run_id into p_run_id;
+
+        call raw.load_bookings(p_run_id);
+        call raw.load_tickets(p_run_id);
+        call raw.load_segments(p_run_id);
+        call raw.load_flights(p_run_id);
+        call raw.load_boarding_passes(p_run_id);
+        call raw.load_routes(p_run_id);
+        call raw.load_airports_data(p_run_id);
+        call raw.load_airplanes_data(p_run_id);
+        call raw.load_seats(p_run_id);
+
+        call etl.check_raw(p_run_id);
+
+        
+        call stg.load_bookings(p_run_id);
+        call stg.load_tickets(p_run_id);
+        call stg.load_segments(p_run_id);
+        call stg.load_flights(p_run_id);
+        call stg.load_boarding_passes(p_run_id);
+        call stg.load_routes(p_run_id);
+        call stg.load_airports(p_run_id);
+        call stg.load_airplanes(p_run_id);
+        call stg.load_seats(p_run_id);
+        
+        call etl.check_stg(p_run_id);
+        
+        -- закрываем run: FAILED, если упал хотя бы один этап
+        select count(*)
+        into v_failed_steps
+        from etl.etl_step_logs
+        where run_id = p_run_id
+                and status = 'FAILED';
+
+        update etl.etl_runs
+        set
+                ended_at = clock_timestamp(),
+                status = case when v_failed_steps = 0 then 'SUCCESS' else 'FAILED' end,
+                error_message = case when v_failed_steps = 0 then null
+                        else v_failed_steps || ' step(s) failed, see etl.etl_step_logs' end
+        where run_id = p_run_id;
+
+        raise notice 'run_id = %, failed steps = %', p_run_id, v_failed_steps;
+end;
+$$ language plpgsql;
+
+
+delete from etl.etl_runs;
+
+select * from etl.etl_runs er;
+select * from etl.etl_step_logs esl;
+select * from etl.etl_dq_results edr;
+select * from etl.etl_quarantine eq;
+select * from etl.etl_dq_results edr;
