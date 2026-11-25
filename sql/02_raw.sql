@@ -1165,6 +1165,8 @@ $$;
 
 
 
+-- старый ручной запуск, заменён на call etl.run_pipeline() (Airlines - Orchestration.sql)
+/*
 do $$
 declare
         p_run_id int;
@@ -1204,6 +1206,7 @@ begin
         raise notice 'run_id = %, failed steps = %', p_run_id, v_failed_steps;
 end;
 $$ language plpgsql;
+*/
 
 
 select * from raw.airplanes_data ad;
