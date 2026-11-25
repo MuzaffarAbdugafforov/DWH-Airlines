@@ -1207,3 +1207,4 @@ $$ language plpgsql;
 
 
 select * from raw.airplanes_data ad;
+select * from etl.etl_dq_results edr;

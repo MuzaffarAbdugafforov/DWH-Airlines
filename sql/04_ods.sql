@@ -1444,10 +1444,10 @@ as $$
 			count(*),
 			count(*) filter (where c.boardings > c.capacity),
 			coalesce(to_jsonb((array_agg(c.flight_id order by c.flight_id) filter (where c.boardings > c.capacity))[1:10]), '[]'),
-			case
+			case	
 				when count(*) filter (where c.boardings > c.capacity) = 0 then 'PASSED'
 				else 'FAILED'
-			end
+			
 		from (
 			select
 				b.flight_id,
@@ -1481,3 +1481,78 @@ as $$
 
 	end;
 $$;
+
+
+do $$
+declare
+        p_run_id int;
+        v_failed_steps int;
+begin
+        insert into etl.etl_runs (load_type)
+        values ('FULL')
+        returning run_id into p_run_id;
+
+        call raw.load_bookings(p_run_id);
+        call raw.load_tickets(p_run_id);
+        call raw.load_segments(p_run_id);
+        call raw.load_flights(p_run_id);
+        call raw.load_boarding_passes(p_run_id);
+        call raw.load_routes(p_run_id);
+        call raw.load_airports_data(p_run_id);
+        call raw.load_airplanes_data(p_run_id);
+        call raw.load_seats(p_run_id);
+
+        call etl.check_raw(p_run_id);
+
+        
+        call stg.load_bookings(p_run_id);
+        call stg.load_tickets(p_run_id);
+        call stg.load_segments(p_run_id);
+        call stg.load_flights(p_run_id);
+        call stg.load_boarding_passes(p_run_id);
+        call stg.load_routes(p_run_id);
+        call stg.load_airports(p_run_id);
+        call stg.load_airplanes(p_run_id);
+        call stg.load_seats(p_run_id);
+        
+        call etl.check_stg(p_run_id);
+        
+		call ods.clear_ods(p_run_id);          -- only acts on FULL
+		
+		call ods.load_airport(p_run_id);
+		call ods.load_airplane(p_run_id);
+		call ods.load_seat(p_run_id);          -- after airplane
+		call ods.load_route(p_run_id);         -- after airport + airplane
+		call ods.load_flight(p_run_id);        -- no FK to route; after route anyway, for DQ_ODS_001
+		call ods.load_booking(p_run_id);
+		call ods.load_ticket(p_run_id);        -- after booking
+		call ods.load_segment(p_run_id);       -- after ticket + flight
+		call ods.load_boarding_pass(p_run_id); -- after segment
+        
+        call etl.check_ods(p_run_id);
+        -- закрываем run: FAILED, если упал хотя бы один этап
+        select count(*)
+        into v_failed_steps
+        from etl.etl_step_logs
+        where run_id = p_run_id
+                and status = 'FAILED';
+
+        update etl.etl_runs
+        set
+                ended_at = clock_timestamp(),
+                status = case when v_failed_steps = 0 then 'SUCCESS' else 'FAILED' end,
+                error_message = case when v_failed_steps = 0 then null
+                        else v_failed_steps || ' step(s) failed, see etl.etl_step_logs' end
+        where run_id = p_run_id;
+
+        raise notice 'run_id = %, failed steps = %', p_run_id, v_failed_steps;
+end;
+$$ language plpgsql;
+
+
+delete from etl.etl_runs;
+
+select * from etl.etl_runs er;
+select * from etl.etl_step_logs esl;
+select * from etl.etl_dq_results edr;
+select * from etl.etl_quarantine eq;
